@@ -103,6 +103,14 @@ func interact(_ args: [String]) async throws {
         guard let owner = NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.xinWeChat").first else {
             throw Problem("微信未运行")
         }
+        // Launch Services can bring an existing app out of a different Stage
+        // Manager group even when a background process cannot activate it directly.
+        if let url = owner.bundleURL, !owner.isActive {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.addsToRecentItems = false
+            _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        }
         try restoreClassroom(owner)
         return
     }
