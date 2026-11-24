@@ -39,44 +39,99 @@ func checkScene(_ reference: CGImage, _ live: CGImage, x: Double, y: Double) thr
     }
 }
 
+func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, name as CFString, &value)
+    return value
+}
+
+func restoreClassroom(_ owner: NSRunningApplication) throws {
+    guard AXIsProcessTrusted() else { throw Problem("恢复课堂窗口需要辅助功能权限") }
+    owner.unhide()
+    owner.activate()
+    let app = AXUIElementCreateApplication(owner.processIdentifier)
+    AXUIElementSetMessagingTimeout(app, 0.8)
+    let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+    let classroom = windows.filter { attribute($0, kAXTitleAttribute) as? String == "长江雨课堂" }
+    if classroom.count > 1 { throw Problem("存在多个同名课堂窗口") }
+    if let window = classroom.first {
+        if (attribute(window, kAXMinimizedAttribute) as? Bool) == true {
+            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+    // WeChat may expose Stage Manager's thumbnail only through its Window menu.
+    if let bar = attribute(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() {
+        let items = attribute(bar as! AXUIElement, kAXChildrenAttribute) as? [AXUIElement] ?? []
+        if let menu = items.first(where: { ["窗口","Window"].contains(attribute($0,kAXTitleAttribute) as? String ?? "") }) {
+            AXUIElementPerformAction(menu, kAXPressAction as CFString)
+            let children = attribute(menu, kAXChildrenAttribute) as? [AXUIElement] ?? []
+            let entries = children.flatMap { attribute($0,kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+            let exact = entries.filter { attribute($0,kAXTitleAttribute) as? String == "长江雨课堂" }
+            if exact.count == 1, AXUIElementPerformAction(exact[0], kAXPressAction as CFString) == .success { return }
+            AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+        }
+    }
+    if classroom.isEmpty { throw Problem("微信中没有可恢复的长江雨课堂窗口") }
+}
+
+// A blank mini-program sometimes exposes Reload only in its own View menu.
+func reloadBlankWindow(_ pid: pid_t) throws {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.8)
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+          let front = attribute(app, kAXFocusedWindowAttribute),
+          CFGetTypeID(front) == AXUIElementGetTypeID(),
+          attribute(front as! AXUIElement, kAXTitleAttribute) as? String == "长江雨课堂",
+          let bar = attribute(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID()
+    else { throw Problem("当前活动窗口无法确认为长江雨课堂") }
+    let menus = attribute(bar as! AXUIElement, kAXChildrenAttribute) as? [AXUIElement] ?? []
+    guard let view = menus.first(where: { ["查看","显示","View"].contains(attribute($0,kAXTitleAttribute) as? String ?? "") })
+    else { throw Problem("找不到小程序查看菜单") }
+    AXUIElementPerformAction(view,kAXPressAction as CFString)
+    defer { AXUIElementPerformAction(view,kAXCancelAction as CFString) }
+    let children = attribute(view,kAXChildrenAttribute) as? [AXUIElement] ?? []
+    let items = children.flatMap { attribute($0,kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+    let refresh = items.filter { ["刷新","重新加载","重新载入","Reload","Refresh"].contains(attribute($0,kAXTitleAttribute) as? String ?? "") }
+    guard refresh.count == 1, AXUIElementPerformAction(refresh[0],kAXPressAction as CFString) == .success
+    else { throw Problem("小程序没有可用的刷新菜单项") }
+}
+
 @available(macOS 14.0, *)
 func interact(_ args: [String]) async throws {
+    if args[0] == "focus" {
+        guard let owner = NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.xinWeChat").first else {
+            throw Problem("微信未运行")
+        }
+        try restoreClassroom(owner)
+        return
+    }
     var window = try await targetWindow(requireFullSize: false)
-    if args[0] == "focus" || (args[0] == "act" && args.count >= 2 && UInt32(args[1]) == window.windowID),
+    if args[0] == "act", args.count >= 2, UInt32(args[1]) == window.windowID,
        let pid = window.owningApplication?.processID,
-       (args[0] == "focus" || NSWorkspace.shared.frontmostApplication?.processIdentifier != pid) {
-        NSRunningApplication(processIdentifier: pid)?.activate()
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.5)
-        func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-            var value: CFTypeRef?
-            AXUIElementCopyAttributeValue(element, name as CFString, &value)
-            return value
-        }
-        if let bar = attribute(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() {
-            let items = attribute(bar as! AXUIElement, kAXChildrenAttribute) as? [AXUIElement] ?? []
-            if let menu = items.first(where: { (attribute($0, kAXTitleAttribute) as? String) == "窗口" }) {
-                AXUIElementPerformAction(menu, kAXPressAction as CFString)
-                let children = attribute(menu, kAXChildrenAttribute) as? [AXUIElement] ?? []
-                let entries = children.flatMap { attribute($0, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
-                if let entry = entries.first(where: { (attribute($0, kAXTitleAttribute) as? String) == "长江雨课堂" }) {
-                    AXUIElementPerformAction(entry, kAXPressAction as CFString)
-                } else { AXUIElementPerformAction(menu, kAXCancelAction as CFString) }
-            }
-        }
+       let owner = NSRunningApplication(processIdentifier: pid),
+       NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+        try restoreClassroom(owner)
         try await Task.sleep(for: .milliseconds(650))
         window = try await targetWindow()
     }
-    if args[0] == "focus" { return }
     guard window.frame.width >= 280 else { throw Problem("课堂窗口已缩小，请恢复为正常大小") }
     let image = try await capture(window)
-    if args[0] == "frame" {
+    if args[0] == "reload" {
+        guard args.count == 3, UInt32(args[1]) == window.windowID,
+              let pid = window.owningApplication?.processID, try readText(image).isEmpty
+        else { throw Problem("窗口已变化，取消空白页刷新") }
+        try checkScene(loadImage(args[2]), image, x: 0.5, y: 0.5)
+        try reloadBlankWindow(pid)
+        return
+    }
+    if ["frame", "recovery-frame"].contains(args[0]) {
         guard args.count == 3 else { throw Problem("frame 需要课程名和临时图片路径") }
         let lines = try readText(image)
         let info = Frame(id: window.windowID,
                          lines: lines.map { FrameLine(text: $0.text,x: $0.box.midX,y: $0.box.midY) },
                          pending: try detect(image, course: args[1]))
-        guard !lines.isEmpty, let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw Problem("无法读取课堂画面") }
+        guard (!lines.isEmpty || args[0] == "recovery-frame"), let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw Problem("无法读取课堂画面") }
         try png.write(to: URL(fileURLWithPath: args[2]),options: .atomic)
         FileHandle.standardOutput.write(try JSONEncoder().encode(info))
         return

@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {"type": "string", "enum": ["focus", "click", "wait", "reload", "needs_user"]},
+    "target": {"type": "integer"},
+    "reason": {"type": "string"}
+  },
+  "required": ["action", "target", "reason"],
+  "additionalProperties": false
+}

@@ -130,8 +130,8 @@ struct Watcher {
         do {
             guard #available(macOS 14.0, *) else { throw Problem("需要 macOS 14 或更高版本") }
             let args = Array(CommandLine.arguments.dropFirst())
-            guard let mode = args.first, ["inspect","check","watch","frame","act","focus"].contains(mode) else { throw Problem("用法: rainwatch inspect|check [课程名] [窗口图片] 或 rainwatch watch [课程名]") }
-            if mode == "frame" || mode == "act" || mode == "focus" {
+            guard let mode = args.first, ["inspect","check","watch","frame","act","focus","recovery-frame","reload"].contains(mode) else { throw Problem("用法: rainwatch inspect|check [课程名] [窗口图片] 或 rainwatch watch [课程名]") }
+            if ["frame","act","focus","recovery-frame","reload"].contains(mode) {
                 try await interact(args)
                 return
             }
@@ -166,7 +166,8 @@ struct Watcher {
                 } catch {
                     if mode != "watch" { throw error }
                     let message = error.localizedDescription
-                    if previous != message { emit("unavailable", detail: message); previous = message }
+                    emit("unavailable", detail: message)
+                    previous = message
                 }
                 if mode == "watch" { emit("tick"); try await Task.sleep(for: .seconds(5)) }
             } while mode == "watch"
