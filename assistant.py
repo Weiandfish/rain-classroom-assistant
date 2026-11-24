@@ -7,6 +7,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import select
+import signal
+import sys
 import subprocess
 import tempfile
 import time
@@ -145,6 +148,38 @@ def answer(course, page, tmp, submitted, journal):
     return "本题未出现可核实的回执"
 
 
+def observations(course, deadline):
+    """Keep one capture process alive so quiet frames never start a new client."""
+    while time.monotonic() < deadline:
+        child = subprocess.Popen([BIN, "watch", course], stdout=subprocess.PIPE, bufsize=0)
+        activity = time.monotonic()
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([child.stdout], [], [], min(10, max(0, deadline-time.monotonic())))
+                if not ready:
+                    if time.monotonic() - activity > 45:
+                        yield {"state":"unavailable","detail":"系统窗口采集超时","cards":[]}
+                        break
+                    continue
+                line = child.stdout.readline()
+                if not line:
+                    break
+                info = json.loads(line)
+                activity = time.monotonic()
+                if info["state"] != "tick":
+                    yield info
+        finally:
+            child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+        if time.monotonic() < deadline:
+            time.sleep(2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--course", default="人工智能精通I")
@@ -169,9 +204,13 @@ def main():
     retry_at = {}
     log("started", course=args.course, lesson=args.lesson, pid=os.getpid(), detect_only=args.detect_only)
     with tempfile.TemporaryDirectory(prefix="rain-exercise-") as directory:
-        while time.monotonic() < deadline:
+        for info in observations(args.course, deadline):
             try:
-                info = native("check", args.course)
+                if info["state"] == "unavailable":
+                    if info["detail"] != last:
+                        log("unavailable", detail=info["detail"])
+                    last = info["detail"]
+                    continue
                 if info["state"] == "ended":
                     log("stopped", reason="课堂已结束")
                     return
@@ -195,9 +234,9 @@ def main():
                 if detail != last:
                     log("unavailable", detail=detail)
                 last = detail
-            time.sleep(5)
     log("stopped", reason="监视时段结束")
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     main()

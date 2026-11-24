@@ -137,6 +137,7 @@ struct Watcher {
             }
             let course = args.count > 1 ? args[1] : "人工智能精通I"
             var previous: String?
+            var lastEvent = Date.distantPast
             repeat {
                 do {
                     let image: CGImage
@@ -157,13 +158,17 @@ struct Watcher {
                     let cards = try detect(image, course: course)
                     let state = cards.isEmpty ? "no_match" : "pending"
                     let key = state + cards.map(\.page).joined(separator: ",")
-                    if previous != key { emit(state, cards); previous = key }
+                    if previous != key || (!cards.isEmpty && Date().timeIntervalSince(lastEvent) >= 60) {
+                        emit(state, cards)
+                        previous = key
+                        lastEvent = Date()
+                    }
                 } catch {
                     if mode != "watch" { throw error }
                     let message = error.localizedDescription
                     if previous != message { emit("unavailable", detail: message); previous = message }
                 }
-                if mode == "watch" { try await Task.sleep(for: .seconds(5)) }
+                if mode == "watch" { emit("tick"); try await Task.sleep(for: .seconds(5)) }
             } while mode == "watch"
         } catch { emit("error", detail: error.localizedDescription); exit(1) }
     }
