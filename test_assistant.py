@@ -13,8 +13,8 @@ def line(text, x, y):
 
 class FlowTests(unittest.TestCase):
     def test_submission_and_receipt(self):
-        pending = dict(id=1, pending=[dict(page="P20")], lines=[line("P20", .3, .2)])
-        detail = dict(id=1, pending=[], lines=[line("提交", .5, .9)])
+        pending = dict(id=1, pending=[dict(page="P20",x=.4,y=.2)], lines=[line("P20", .3, .2),line("P20", .9, .55)])
+        detail = dict(id=1, pending=[], lines=[line("P20", .9, .2),line("提交", .5, .9)])
         receipt = dict(id=1, pending=[], lines=[
             line("PPT", .3, .1), line("习题", .5, .1), line("P20", .3, .2)])
         frames = iter([pending, detail, detail, receipt])

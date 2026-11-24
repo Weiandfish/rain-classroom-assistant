@@ -1,6 +1,5 @@
 import Foundation
 import AppKit
-import ScreenCaptureKit
 import Vision
 import ImageIO
 
@@ -66,49 +65,85 @@ func compact(_ text: String) -> String {
 struct Detection: Codable, Equatable {
     let page: String
     let status: String
+    let x: Double
+    let y: Double
 }
 
-func detect(_ image: CGImage, course: String) throws -> [Detection] {
-    let bands = try blueBands(image)
-    guard !bands.isEmpty else { return [] }
-    let lines = try readText(image)
-    guard lines.contains(where: { $0.box.midY < 0.12 && compact($0.text) == compact(course) }) else { return [] }
+func classroomHeader(_ image: CGImage, course: String) throws -> Bool {
+    let region = CGRect(x: 0, y: 0, width: image.width, height: max(1, image.height/6))
+    guard let header = image.cropping(to: region) else { return false }
+    let labels = try readText(header).map { compact($0.text) }
+    return labels.contains(compact(course)) && labels.contains("习题") && labels.contains("PPT")
+}
+
+// The caller has verified the course on the cropped header. Recognize each
+// candidate on its own: full-frame Vision can misread the same title and tabs.
+func pendingCards(_ image: CGImage) throws -> [Detection] {
     var detections = [Detection]()
-    for band in bands {
-        let card = lines.filter { band.contains($0.box.midY) }
-        guard card.contains(where: { compact($0.text).contains("课堂习题") }),
-              card.contains(where: { $0.box.midX > 0.57 && compact($0.text).contains("未完成") }) else { continue }
-        let page = card.map { compact($0.text) }.first { $0.range(of: "^P[0-9]+$", options: [.regularExpression,.caseInsensitive]) != nil } ?? "未知页码"
-        detections.append(Detection(page: page, status: "未完成"))
+    for band in try blueBands(image) {
+        let h = CGFloat(image.height)
+        let rect = CGRect(x: 0, y: max(0, band.lowerBound*h-3), width: CGFloat(image.width),
+                          height: (band.upperBound-band.lowerBound)*h+6)
+        guard let card = image.cropping(to: rect) else { continue }
+        let lines = try readText(card)
+        guard lines.contains(where: { compact($0.text).contains("课堂习题") }),
+              lines.contains(where: { $0.box.midX > 0.57 && compact($0.text).contains("未完成") }) else { continue }
+        let pageLine = lines.first { compact($0.text).range(of: "^P[0-9]+$", options: [.regularExpression,.caseInsensitive]) != nil }
+        let page = pageLine.map { compact($0.text).uppercased() } ?? "未知页码"
+        detections.append(Detection(page: page, status: "未完成", x: 0.5, y: rect.midY/h))
     }
     return detections
 }
 
-@available(macOS 14.0, *)
-func targetWindow(requireFullSize: Bool = true) async throws -> SCWindow {
-    let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
-    let windows = content.windows.filter {
-        $0.title == "长江雨课堂" && ["com.tencent.xinWeChat","com.tencent.flue.WeApp"].contains($0.owningApplication?.bundleIdentifier ?? "")
+struct ClassroomWindow {
+    let windowID: CGWindowID
+    let frame: CGRect
+    let owningApplication: NSRunningApplication?
+    var fullSize: Bool { frame.width >= 280 && frame.height >= 350 }
+}
+
+func targetWindow(requireFullSize: Bool = true) throws -> ClassroomWindow {
+    let rows = CGWindowListCopyWindowInfo([.optionAll,.excludeDesktopElements], 0) as? [[String:Any]] ?? []
+    let windows = rows.compactMap { row -> ClassroomWindow? in
+        guard row["kCGWindowName"] as? String == "长江雨课堂",
+              let pid = row["kCGWindowOwnerPID"] as? pid_t,
+              let app = NSRunningApplication(processIdentifier: pid),
+              ["com.tencent.xinWeChat","com.tencent.flue.WeApp"].contains(app.bundleIdentifier ?? ""),
+              let id = row["kCGWindowNumber"] as? CGWindowID,
+              let box = row["kCGWindowBounds"] as? NSDictionary,
+              let frame = CGRect(dictionaryRepresentation:box) else { return nil }
+        return ClassroomWindow(windowID:id, frame:frame, owningApplication:app)
     }
-    guard windows.count == 1, let window = windows.first else { throw Problem("课堂窗口数量为 \(windows.count)，等待唯一的长江雨课堂窗口") }
-    guard !requireFullSize || (window.frame.width >= 280 && window.frame.height >= 350) else { throw Problem("课堂窗口已缩小，请恢复为正常大小") }
+    guard windows.count == 1 else { throw Problem("课堂窗口数量为 \(windows.count)，等待唯一的长江雨课堂窗口") }
+    let window = windows[0]
+    guard !requireFullSize || window.fullSize else { throw Problem("课堂窗口已缩小，请恢复为正常大小") }
     return window
 }
 
-@available(macOS 14.0, *)
-func capture(_ window: SCWindow) async throws -> CGImage {
-    let filter = SCContentFilter(desktopIndependentWindow: window)
-    let config = SCStreamConfiguration()
-    config.width = Int(window.frame.width * 2)
-    config.height = Int(window.frame.height * 2)
-    config.showsCursor = false
-    config.ignoreShadowsSingleWindow = true
-    return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+func capture(_ window: ClassroomWindow) async throws -> CGImage {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("frame.png")
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    task.arguments = ["-x", "-o", "-l" + String(window.windowID), file.path]
+    task.standardError = FileHandle.nullDevice
+    try task.run()
+    for _ in 0..<60 {
+        if !task.isRunning { break }
+        try await Task.sleep(for: .milliseconds(100))
+    }
+    if task.isRunning { task.terminate(); throw Problem("系统窗口采集超时") }
+    guard task.terminationStatus == 0 else { throw Problem("课堂截图失败，请检查窗口和录屏权限") }
+    let image = try loadImage(file.path)
+    guard image.width >= 280, image.height >= 350 else { throw Problem("课堂窗口已缩小，请恢复为正常大小") }
+    return image
 }
 
 func loadImage(_ path: String) throws -> CGImage {
     guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
-          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw Problem("无法读取图片") }
+          let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { throw Problem("无法读取图片") }
     return image
 }
 
@@ -136,18 +171,13 @@ struct Watcher {
                 return
             }
             let course = args.count > 1 ? args[1] : "人工智能精通I"
-            var previous: String?
-            var lastEvent = Date.distantPast
             repeat {
                 do {
                     let image: CGImage
                     if args.count == 3 && mode != "watch" { image = try loadImage(args[2]) }
                     else { image = try await capture(targetWindow()) }
                     if mode == "inspect" { for line in try readText(image) { print(line.text) }; return }
-                    let top = CGRect(x: 0, y: 0, width: image.width, height: max(1, image.height/6))
-                    guard let header = image.cropping(to: top) else { throw Problem("窗口画面无效") }
-                    let labels = try readText(header).map { compact($0.text) }
-                    guard labels.contains(compact(course)), labels.contains("习题"), labels.contains("PPT") else {
+                    guard try classroomHeader(image, course: course) else {
                         let text = try readText(image).map { compact($0.text) }
                         if text.contains(where: { ["课堂已结束","本次课堂已结束","本次授课已结束","老师已下课"].contains($0) }) {
                             emit("ended")
@@ -155,21 +185,15 @@ struct Watcher {
                         }
                         throw Problem("未看到指定课程的课堂列表")
                     }
-                    let cards = try detect(image, course: course)
+                    let cards = try pendingCards(image)
                     let state = cards.isEmpty ? "no_match" : "pending"
-                    let key = state + cards.map(\.page).joined(separator: ",")
-                    if previous != key || (!cards.isEmpty && Date().timeIntervalSince(lastEvent) >= 60) {
-                        emit(state, cards)
-                        previous = key
-                        lastEvent = Date()
-                    }
+                    emit(state, cards)
                 } catch {
                     if mode != "watch" { throw error }
                     let message = error.localizedDescription
                     emit("unavailable", detail: message)
-                    previous = message
                 }
-                if mode == "watch" { emit("tick"); try await Task.sleep(for: .seconds(5)) }
+                if mode == "watch" { try await Task.sleep(for: .seconds(5)) }
             } while mode == "watch"
         } catch { emit("error", detail: error.localizedDescription); exit(1) }
     }

@@ -1,5 +1,4 @@
 import AppKit
-import ScreenCaptureKit
 import ApplicationServices
 
 struct FrameLine: Codable {
@@ -10,6 +9,7 @@ struct FrameLine: Codable {
 
 struct Frame: Codable {
     let id: CGWindowID
+    let classroomList: Bool
     let lines: [FrameLine]
     let pending: [Detection]
 }
@@ -97,37 +97,38 @@ func reloadBlankWindow(_ pid: pid_t) throws {
     else { throw Problem("小程序没有可用的刷新菜单项") }
 }
 
+func activateClassroom(_ owner: NSRunningApplication) async throws {
+    // Launch Services can bring an existing app out of a different Stage
+    // Manager group even when a background process cannot activate it directly.
+    if let url = owner.bundleURL, !owner.isActive {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+    }
+    try restoreClassroom(owner)
+}
+
 @available(macOS 14.0, *)
 func interact(_ args: [String]) async throws {
     if args[0] == "focus" {
         guard let owner = NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.xinWeChat").first else {
             throw Problem("微信未运行")
         }
-        // Launch Services can bring an existing app out of a different Stage
-        // Manager group even when a background process cannot activate it directly.
-        if let url = owner.bundleURL, !owner.isActive {
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            configuration.addsToRecentItems = false
-            _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-        }
-        try restoreClassroom(owner)
+        try await activateClassroom(owner)
         return
     }
-    var window = try await targetWindow(requireFullSize: false)
-    if args[0] == "act", args.count >= 2, UInt32(args[1]) == window.windowID,
-       let pid = window.owningApplication?.processID,
-       let owner = NSRunningApplication(processIdentifier: pid),
-       NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
-        try restoreClassroom(owner)
+    var window = try targetWindow(requireFullSize: false)
+    if args[0] == "act", args.count >= 2, UInt32(args[1]) == window.windowID, let owner = window.owningApplication {
+        try await activateClassroom(owner)
         try await Task.sleep(for: .milliseconds(650))
-        window = try await targetWindow()
+        window = try targetWindow()
     }
-    guard window.frame.width >= 280 else { throw Problem("课堂窗口已缩小，请恢复为正常大小") }
+    guard args[0] == "frame" || args[0] == "recovery-frame" || window.fullSize else { throw Problem("课堂窗口已缩小，请恢复为正常大小") }
     let image = try await capture(window)
     if args[0] == "reload" {
         guard args.count == 3, UInt32(args[1]) == window.windowID,
-              let pid = window.owningApplication?.processID, try readText(image).isEmpty
+              let pid = window.owningApplication?.processIdentifier, try readText(image).isEmpty
         else { throw Problem("窗口已变化，取消空白页刷新") }
         try checkScene(loadImage(args[2]), image, x: 0.5, y: 0.5)
         try reloadBlankWindow(pid)
@@ -136,9 +137,10 @@ func interact(_ args: [String]) async throws {
     if ["frame", "recovery-frame"].contains(args[0]) {
         guard args.count == 3 else { throw Problem("frame 需要课程名和临时图片路径") }
         let lines = try readText(image)
-        let info = Frame(id: window.windowID,
+        let classroomList = try classroomHeader(image, course: args[1])
+        let info = Frame(id: window.windowID, classroomList: classroomList,
                          lines: lines.map { FrameLine(text: $0.text,x: $0.box.midX,y: $0.box.midY) },
-                         pending: try detect(image, course: args[1]))
+                         pending: classroomList ? try pendingCards(image) : [])
         guard (!lines.isEmpty || args[0] == "recovery-frame"), let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw Problem("无法读取课堂画面") }
         try png.write(to: URL(fileURLWithPath: args[2]),options: .atomic)
         FileHandle.standardOutput.write(try JSONEncoder().encode(info))
@@ -146,28 +148,47 @@ func interact(_ args: [String]) async throws {
     }
     guard (args.count == 5 || args.count == 6), UInt32(args[1]) == window.windowID,
           let x = Double(args[3]),let y = Double(args[4]), (0.02...0.98).contains(x), (0.018...0.99).contains(y),
-          let pid = window.owningApplication?.processID else { throw Problem("点击目标不匹配") }
+          let pid = window.owningApplication?.processIdentifier else { throw Problem("点击目标不匹配") }
     try checkScene(loadImage(args[2]), image, x: x, y: y)
     let point = CGPoint(x: window.frame.minX+x*window.frame.width, y: window.frame.minY+y*window.frame.height)
-    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],0) as? [[String: Any]] ?? []
-    let hit = windows.first { w in
-        guard (w["kCGWindowLayer"] as? Int ?? -1) >= 0, (w["kCGWindowAlpha"] as? Double ?? 0) > 0.01,
-              let rect = w["kCGWindowBounds"] as? NSDictionary,
-              let bounds = CGRect(dictionaryRepresentation: rect) else { return false }
-        return bounds.contains(point)
+    guard CGPreflightPostEventAccess(), try targetWindow().windowID == window.windowID else {
+        throw Problem("目标窗口不可操作或缺少辅助功能权限")
     }
-    guard hit?["kCGWindowNumber"] as? UInt32 == window.windowID,
-          NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-          CGPreflightPostEventAccess() else { throw Problem("课堂窗口需要位于前台且允许辅助功能控制 (目标 \(window.windowID)/\(pid)，命中 \(hit?["kCGWindowNumber"] ?? "-")，前台 \(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1)，点 \(point)，权限 \(CGPreflightPostEventAccess()))") }
-    for kind: CGEventType in [.leftMouseDown,.leftMouseUp] {
-        guard let event = CGEvent(mouseEventSource: nil, mouseType: kind, mouseCursorPosition: point, mouseButton: .left) else { throw Problem("无法创建点击事件") }
-        event.postToPid(pid)
+    // AX hit testing ignores click-through overlays. The mini-program's content
+    // is rendered by WeChatAppEx, while WindowServer records WeChat as its owner.
+    func targetReceivesClick() -> Bool {
+        let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],0) as? [[String:Any]] ?? []
+        let top = rows.first { row in
+            guard row["kCGWindowLayer"] as? Int == 0, (row["kCGWindowAlpha"] as? Double ?? 0) > 0.01,
+                  let box = row["kCGWindowBounds"] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation:box) else { return false }
+            return rect.contains(point)
+        }
+        guard top?["kCGWindowNumber"] as? CGWindowID == window.windowID,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),Float(point.x),Float(point.y),&hit) == .success,
+              let element = hit else { return false }
+        var receiver: pid_t = 0
+        guard AXUIElementGetPid(element,&receiver) == .success else { return false }
+        return receiver == pid || NSRunningApplication(processIdentifier: receiver)?.bundleIdentifier == "com.tencent.flue.WeChatAppEx"
+    }
+    guard targetReceivesClick() else { throw Problem("课堂控件被遮挡或输入焦点已变化") }
+    let source = CGEventSource(stateID: .hidSystemState)
+    CGWarpMouseCursorPosition(point)
+    for kind: CGEventType in [.mouseMoved,.leftMouseDown,.leftMouseUp] {
+        if kind == .leftMouseDown && !targetReceivesClick() { throw Problem("点击前窗口已变化") }
+        guard let event = CGEvent(mouseEventSource:source, mouseType:kind, mouseCursorPosition:point, mouseButton:.left)
+        else { throw Problem("无法创建课堂点击事件") }
+        event.setIntegerValueField(.mouseEventClickState,value:1)
+        event.post(tap:.cghidEventTap)
+        try await Task.sleep(for: .milliseconds(85))
     }
     if args.count == 6 {
         guard !args[5].isEmpty, args[5].count <= 1000 else { throw Problem("答案长度异常") }
         try await Task.sleep(for: .milliseconds(200))
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-              try await targetWindow().windowID == window.windowID else { throw Problem("输入焦点已变化") }
+              try targetWindow().windowID == window.windowID else { throw Problem("输入焦点已变化") }
         let chars = Array(args[5].utf16)
         for down in [true,false] {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { throw Problem("无法创建输入事件") }

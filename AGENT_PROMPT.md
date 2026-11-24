@@ -5,7 +5,7 @@
 ```text
 请在这台电脑部署并运行我的长江雨课堂习题助手。GitHub 公开仓库是 https://github.com/Weiandfish/rain-classroom-assistant 。课程默认是「人工智能精通I」。请实际完成克隆、编译、测试和现场检查。
 
-先检查操作系统。这个版本使用 Apple ScreenCaptureKit 和 Vision，需要 macOS 14 或更高版本，以及能运行桌面微信的图形会话。如果是 Windows、Linux 或无桌面的远程主机，请告知平台限制。
+先检查操作系统。这个版本使用 macOS 窗口采集与 Apple Vision，需要 macOS 14 或更高版本，以及能运行桌面微信的图形会话。如果是 Windows、Linux 或无桌面的远程主机，请告知平台限制。
 
 通过 HTTPS 克隆公开仓库，复用本机工作台或项目目录。若已有检出，检查 remote 和工作区改动，再安全更新。阅读 README.md，检查 Swift 编译器、make、Python 3.10+、微信及 Codex CLI。运行 make、python3 -m unittest -v 和 codex login status。若需要我登录或授予屏幕录制、辅助功能权限，请说明具体应用和操作。
 
